@@ -49,6 +49,10 @@ class Database {
                 textColor: "white"
               },
               {
+                text: `Fork of aoi.mongo by @atlasfyber`,
+                textColor: "red"
+              },
+              {
                 text: `Cluster Latency: ${latency}ms`,
                 textColor: "white"
               },
