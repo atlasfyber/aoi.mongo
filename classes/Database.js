@@ -1,7 +1,11 @@
 const { MongoClient, ServerApiVersion } = require("mongodb");
 const AoiError = require("aoi.js/src/classes/AoiError");
-class Database {
+const Interpreter = require("aoi.js/src/core/interpreter.js");
+const EventEmitter = require("events");
+class Database extends EventEmitter {
   constructor(client, options) {
+    super();
+
     this.client = client;
     this.options = options;
     this.debug = this.options.debug ?? false;
@@ -36,6 +40,8 @@ class Database {
       this.client.db.db.transfer = this.transfer.bind(this);
       this.client.db.db.avgPing = this.ping.bind(this);
 
+      this.client.db.db.readyAt = Date.now();
+
       await this.client.db.connect();
 
       if (this.options.logging != false) {
@@ -62,6 +68,18 @@ class Database {
           );
         }
       }
+
+      const client = this.client;
+
+      this.client.once("ready", async () => {
+        await require("aoi.js/src/events/Custom/timeout.js")({ client, interpreter: Interpreter }, undefined, undefined, true);
+
+        setInterval(async () => {
+          await require("aoi.js/src/events/Custom/handleResidueData.js")(client);
+        }, 3.6e6);
+      });
+
+      this.emit("ready", { client: this.client });
     } catch (err) {
       AoiError.createConsoleMessage(
         [
@@ -81,12 +99,9 @@ class Database {
     }
 
     if (this.options?.convertOldData?.enabled == true) {
-      await new Promise((resolve) => {
-        this.client.once("ready", () => {
-          setTimeout(resolve, 5e3);
-        });
+      this.client.once("ready", () => {
+        require("./backup")(this.client, this.options);
       });
-      require("./backup")(this.client, this.options);
     }
   }
 
@@ -100,42 +115,48 @@ class Database {
   async get(table, key, id = undefined) {
     const col = this.client.db.db(table).collection(key);
     const aoijs_vars = ["cooldown", "setTimeout", "ticketChannel"];
+    let keyValue = key;
+    if (id) keyValue = `${key}_${id}`;
 
     if (this.debug == true) {
-      console.log(`[received] get(${table}, ${key}, ${id})`);
+      console.debug(`[received] get(${table}, ${keyValue})`);
     }
 
     let data;
     if (aoijs_vars.includes(key)) {
-      data = await col.findOne({ key: `${key}_${id}` });
+      data = await col.findOne({ key: keyValue });
     } else {
       if (!this.client.variableManager.has(key, table)) return;
       const __var = this.client.variableManager.get(key, table)?.default;
-      data = (await col.findOne({ key: `${key}_${id}` })) || __var;
+      data = (await col.findOne({ key: keyValue })) || __var;
     }
 
     if (this.debug == true) {
-      console.log(`[returning] get(${table}, ${key}, ${id}) -> ${typeof data === "object" ? JSON.stringify(data) : data}`);
+      console.debug(`[returning] get(${table}, ${keyValue}) -> ${typeof data === "object" ? JSON.stringify(data) : data}`);
     }
 
     return data;
   }
 
   async set(table, key, id, value) {
-    if (this.debug == true) {
-      console.log(`[received] set(${table}, ${key}, ${id}, ${typeof value === "object" ? JSON.stringify(value) : value})`);
+    let keyValue = key;
+    if (id) keyValue = `${key}_${id}`;
+
+    if (this.debug === true) {
+      console.debug(`[received] set(${table}, ${keyValue}, ${typeof value === "object" ? JSON.stringify(value) : value})`);
     }
 
     const col = this.client.db.db(table).collection(key);
-    await col.updateOne({ key: `${key}_${id}` }, { $set: { value: value } }, { upsert: true });
-    if (this.debug == true) {
-      console.log(`[returning] set(${table}, ${key}, ${id}, ${value}) ->${typeof value === "object" ? JSON.stringify(value) : value}`);
+    await col.updateOne({ key: keyValue }, { $set: { value: value } }, { upsert: true });
+
+    if (this.debug === true) {
+      console.debug(`[returning] set(${table}, ${keyValue}, ${typeof value === "object" ? JSON.stringify(value) : value})`);
     }
   }
 
   async drop(table, variable) {
     if (this.debug == true) {
-      console.log(`[received] drop(${table}, ${variable})`);
+      console.debug(`[received] drop(${table}, ${variable})`);
     }
     if (variable) {
       await this.client.db.db(table).collection(variable).drop();
@@ -144,7 +165,7 @@ class Database {
     }
 
     if (this.debug == true) {
-      console.log(`[returning] drop(${table}, ${variable}) -> dropped ${table}`);
+      console.debug(`[returning] drop(${table}, ${variable}) -> dropped ${table}`);
     }
   }
 
@@ -154,37 +175,52 @@ class Database {
   }
 
   async deleteMany(table, query) {
+    if (this.debug == true) {
+      console.debug(`[received] deleteMany(${table}, ${query})`);
+    }
+
     const db = this.client.db.db(table);
     const collections = await db.listCollections().toArray();
 
     for (let collection of collections) {
       const col = db.collection(collection.name);
-      await col.deleteMany({ q: query });
-
-      const cd = await col.countDocuments();
-      if (cd === 0) {
-        await col.drop(table);
+      if (this.debug == true) {
+        const data = await col.find({ q: query }).toArray();
+        console.debug(`[returning] deleteMany(${table}, ${query}) -> ${data}`);
       }
+
+      await col.deleteMany({ q: query });
+    }
+    if (this.debug == true) {
+      console.debug(`[returning] deleteMany(${table}, ${query}) -> deleted`);
     }
   }
 
   async delete(table, key, id) {
+    if (id) key = `${key}_${id}`;
+    else key = key;
+
+    if (this.debug == true) {
+      console.debug(`[received] delete(${table}, ${key})`);
+    }
     const db = this.client.db.db(table);
     const collections = await db.listCollections().toArray();
 
-    const dbkey = `${key}_${id}`;
-
     for (let collection of collections) {
       const col = db.collection(collection.name);
-      const doc = await col.findOne({ key: dbkey });
+      const doc = await col.findOne({ key });
 
-      if (doc) {
-        await col.deleteOne({ key: dbkey });
+      if (!doc) continue;
 
-        if ((await col.countDocuments({})) === 0) await col.drop(table, key);
-
-        break;
+      if (this.debug == true) {
+        console.debug(`[returning] delete(${table}, ${key}) -> ${doc.value}`);
       }
+
+      await col.deleteOne({ key });
+      break;
+    }
+    if (this.debug == true) {
+      console.debug(`[returned] delete(${table}, ${key}) -> deleted`);
     }
   }
 
@@ -219,7 +255,7 @@ class Database {
     const collections = await db.listCollections().toArray();
     let results = [];
     if (this.debug == true) {
-      console.log(`[received] all(${table}, ${filter}, ${list}, ${sort})`);
+      console.debug(`[received] all(${table}, ${filter}, ${list}, ${sort})`);
     }
     for (let collection of collections) {
       const col = db.collection(collection.name);
@@ -234,7 +270,7 @@ class Database {
       results.sort((a, b) => b.value - a.value);
     }
     if (this.debug == true) {
-      console.log(`[returning] all(${table}, ${filter}, ${list}, ${sort}) -> ${JSON.stringify(results)} items`);
+      console.debug(`[returning] all(${table}, ${filter}, ${list}, ${sort}) -> ${JSON.stringify(results)} items`);
     }
     return results.slice(0, list);
   }
